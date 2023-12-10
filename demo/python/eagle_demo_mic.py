@@ -100,45 +100,45 @@ def test_operation(args):
         enrollment_animation = EnrollmentAnimation()
 
         try:
-            recording_active = False
+            recording_active = {label: False for label in speaker_labels}
+            start_times = {label: None for label in speaker_labels}
+            speech_buffer = {label: [] for label in speaker_labels}
 
             while True:
                 pcm = recorder.read()
-                if args.output_audio_path is not None and recording_active:
-                    test_audio_file.writeframes(struct.pack('%dh' % len(pcm), *pcm))
+                if args.output_audio_path is not None:
+                    for label, active in recording_active.items():
+                        if active:
+                            test_audio_file.writeframes(struct.pack('%dh' % len(pcm), *pcm))
 
                 scores = eagle.process(pcm)
                 print_result(scores, speaker_labels)
 
                 for label, confidence in zip(speaker_labels, scores):
                     if confidence > 0.0:
-                        if not recording_active:
-                            recording_active = True
+                        if not recording_active[label]:
+                            recording_active[label] = True
                             start_times[label] = time.time()
-                            # Start of speech, save audio buffer
-                            speech_buffer = []
-                    elif recording_active:
-                        # Append audio to buffer during speech
-                        speech_buffer.extend(pcm)
-
-                for label, start_time in start_times.items():
-                    if start_time is not None:
-                        # Check for end of speech
+                            #start of speech, initialize audio buffer
+                            speech_buffer[label] = []
+                        else:
+                            #append audio to buffer during speech
+                            speech_buffer[label].extend(pcm)
+                    elif recording_active[label]:
+                        #check for end of speech
                         end_time = time.time()
-                        duration = end_time - start_time
-                        if duration > args.min_speech_duration and all(score == 0.0 for score in scores):
-                            # Save the audio buffer associated with the speech
-                            export_path = f"{label}_speech_{int(start_time)}.wav"
+                        duration = end_time - start_times[label]
+                        if duration > args.min_speech_duration:
+                            #here i save the audio buffer associated with the speech
+                            export_path = f"{label}_speech_{int(start_times[label])}.wav"
                             with wave.open(export_path, 'wb') as export_file:
                                 export_file.setnchannels(1)
                                 export_file.setsampwidth(2)
                                 export_file.setframerate(eagle.sample_rate)
-                                export_file.writeframes(struct.pack('%dh' % len(speech_buffer), *speech_buffer))
+                                export_file.writeframes(struct.pack('%dh' % len(speech_buffer[label]), *speech_buffer[label]))
                             print(f"\nSpeaker '{label}' talked with confidence > 0.0 for {duration:.2f} seconds\n"
-                                f"Audio saved to: {export_path}\n")
-                            start_times[label] = None
-                            recording_active = False
-                            speech_buffer = []
+                                  f"Audio saved to: {export_path}\n")
+                        recording_active[label] = False
 
         except KeyboardInterrupt:
             print('\nStopping...')
