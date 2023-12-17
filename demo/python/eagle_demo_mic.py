@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import os
 import struct
+import threading
 import time
 import wave
 
@@ -15,11 +16,11 @@ FEEDBACK_TO_DESCRIPTIVE_MSG = {
     pveagle.EagleProfilerEnrollFeedback.AUDIO_TOO_SHORT: 'Insufficient audio length',
     pveagle.EagleProfilerEnrollFeedback.UNKNOWN_SPEAKER: 'Different speaker in audio',
     pveagle.EagleProfilerEnrollFeedback.NO_VOICE_FOUND: 'No voice found in audio',
-    pveagle.EagleProfilerEnrollFeedback.QUALITY_ISSUE: 'Low audio quality due to a bad microphone or environment'
+    pveagle.EagleProfilerEnrollFeedback.QUALITY_ISSUE: 'Low audio quality due to bad microphone or environment'
 }
 
 
-class EnrollmentAnimation:
+class EnrollmentAnimation(threading.Thread):
     def __init__(self, sleep_time_sec=0.1):
         self._sleep_time_sec = sleep_time_sec
         self._frames = [
@@ -33,8 +34,9 @@ class EnrollmentAnimation:
         self._done = False
         self._percentage = 0
         self._feedback = ''
+        super().__init__()
 
-    def start(self):
+    def run(self):
         self._done = False
         while not self._done:
             for frame in self._frames:
@@ -69,6 +71,65 @@ def print_result(scores, labels):
     result += ', '.join('`%s`: %.2f' % (label, score) for label, score in zip(labels, scores))
     print(result, end='', flush=True)
 
+
+def enroll_operation(args):
+    try:
+            eagle_profiler = pveagle.create_profiler(
+                access_key=args.access_key,
+                model_path=args.model_path,
+                library_path=args.library_path)
+    except pveagle.EagleError as e:
+        print("Failed to initialize Eagle: %s" % e)
+        raise
+
+    print('Eagle version: %s' % eagle_profiler.version)
+    recorder = PvRecorder(frame_length=PV_RECORDER_FRAME_LENGTH, device_index=args.audio_device_index)
+    print("Recording audio from '%s'" % recorder.selected_device)
+    num_enroll_frames = eagle_profiler.min_enroll_samples // PV_RECORDER_FRAME_LENGTH
+    sample_rate = eagle_profiler.sample_rate
+    enrollment_animation = EnrollmentAnimation()
+    print('Please keep speaking until the enrollment percentage reaches 100%')
+    try:
+        with contextlib.ExitStack() as file_stack:
+            if args.output_audio_path is not None:
+                enroll_audio_file = file_stack.enter_context(wave.open(args.output_audio_path, 'wb'))
+                enroll_audio_file.setnchannels(1)
+                enroll_audio_file.setsampwidth(2)
+                enroll_audio_file.setframerate(sample_rate)
+
+            enroll_percentage = 0.0
+            enrollment_animation.start()
+            while enroll_percentage < 100.0:
+                enroll_pcm = list()
+                recorder.start()
+                for _ in range(num_enroll_frames):
+                    input_frame = recorder.read()
+                    if args.output_audio_path is not None:
+                        enroll_audio_file.writeframes(struct.pack('%dh' % len(input_frame), *input_frame))
+                    enroll_pcm.extend(input_frame)
+                recorder.stop()
+
+                enroll_percentage, feedback = eagle_profiler.enroll(enroll_pcm)
+                enrollment_animation.percentage = enroll_percentage
+                enrollment_animation.feedback = ' - %s' % FEEDBACK_TO_DESCRIPTIVE_MSG[feedback]
+
+        speaker_profile = eagle_profiler.export()
+        enrollment_animation.stop()
+        with open(args.output_profile_path, 'wb') as f:
+            f.write(speaker_profile.to_bytes())
+        print('\nSpeaker profile is saved to %s' % args.output_profile_path)
+
+    except KeyboardInterrupt:
+        print('\nStopping enrollment. No speaker profile is saved.')
+        enrollment_animation.stop()
+    except pveagle.EagleActivationLimitError:
+        print('AccessKey has reached its processing limit')
+    except pveagle.EagleError as e:
+        print('Failed to enroll speaker: %s' % e)
+    finally:
+        recorder.stop()
+        recorder.delete()
+        eagle_profiler.delete()
 
 def test_operation(args):
     profiles = list()
@@ -137,7 +198,7 @@ def test_operation(args):
                                 export_file.setframerate(eagle.sample_rate)
                                 export_file.writeframes(struct.pack('%dh' % len(speech_buffer[label]), *speech_buffer[label]))
                             print(f"\nSpeaker '{label}' talked with confidence > 0.0 for {duration:.2f} seconds\n"
-                                  f"Audio saved to: {export_path}\n")
+                                    f"Audio saved to: {export_path}\n")
                         recording_active[label] = False
 
         except KeyboardInterrupt:
@@ -151,10 +212,13 @@ def test_operation(args):
             recorder.delete()
 
 
-
-
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--show_audio_devices',
+        action='store_true',
+        help='List available audio input devices and exit')
+
     common_parser = argparse.ArgumentParser(add_help=False)
     common_parser.add_argument(
         '--access_key',
@@ -162,7 +226,7 @@ def main():
         help='AccessKey obtained from Picovoice Console (https://console.picovoice.ai/)')
     common_parser.add_argument(
         '--library_path',
-        help='Absolute path to a dynamic library. Default: using the library provided by `pveagle`')
+        help='Absolute path to dynamic library. Default: using the library provided by `pveagle`')
     common_parser.add_argument(
         '--model_path',
         help='Absolute path to Eagle model. Default: using the model provided by `pveagle`')
@@ -170,13 +234,14 @@ def main():
     common_parser.add_argument(
         '--output_audio_path',
         help='If provided, all recorded audio data will be saved to the given .wav file')
-    common_parser.add_argument(
-        '--min_speech_duration',
-        type=float,
-        default=4.0,
-        help='Minimum duration (in seconds) for speech segments to be saved. Default: 2.0')
 
     subparsers = parser.add_subparsers(dest='command')
+
+    enroll = subparsers.add_parser('enroll', help='Enroll a new speaker profile', parents=[common_parser])
+    enroll.add_argument(
+        '--output_profile_path',
+        required=True,
+        help='Absolute path to output file for the created profile')
 
     test = subparsers.add_parser(
         'test',
@@ -187,18 +252,23 @@ def main():
         required=True,
         nargs='+',
         help='Absolute path(s) to speaker profile(s)')
+    test.add_argument(
+        '--min_speech_duration',
+        type=float,
+        default=4.0,
+        help='Minimum duration (in seconds) for speech segments to be saved. Default: 4.0')
 
-    args = argparse.Namespace()  # Create an empty namespace to store the arguments
-    args.show_audio_devices = False  # Add a default value to the new argument
-
-    args = parser.parse_args(namespace=args)
+    args = parser.parse_args()
 
     if args.show_audio_devices:
         for index, name in enumerate(PvRecorder.get_available_devices()):
             print('Device #%d: %s' % (index, name))
         return
 
-    if args.command == 'test':
+    if args.command == 'enroll':
+        enroll_operation(args)
+
+    elif args.command == 'test':
         test_operation(args)
 
     else:
